@@ -9,6 +9,7 @@ import {
 	TextComponent,
 	TFile,
 	TFolder,
+	WorkspaceLeaf,
 } from 'obsidian';
 
 import { MARKWHEN_ICON } from './icons';
@@ -32,6 +33,22 @@ const DEFAULT_SETTINGS: MarkwhenPluginSettings = {
 
 export default class MarkwhenPlugin extends Plugin {
 	settings: MarkwhenPluginSettings;
+	/** Live timeline iframes moved out of a hidden leaf so their scroll date survives. */
+	parkedFrames = new Map<string, HTMLIFrameElement>();
+	/** Note pane already opened to the right of a markwhen file. */
+	linkedNoteLeaves = new Map<string, WorkspaceLeaf>();
+	parkHost: HTMLDivElement | null = null;
+
+	ensureParkHost(): HTMLDivElement {
+		if (!this.parkHost) {
+			this.parkHost = document.createElement('div');
+			this.parkHost.className = 'markwhen-frame-park';
+			this.parkHost.style.cssText =
+				'position:fixed;left:0;top:0;width:0;height:0;overflow:visible;visibility:hidden;pointer-events:none;z-index:-1;';
+			document.body.appendChild(this.parkHost);
+		}
+		return this.parkHost;
+	}
 
 	async onload() {
 		await this.loadSettings();
@@ -100,7 +117,11 @@ export default class MarkwhenPlugin extends Plugin {
 		this.addSettingTab(new MarkwhenPluginSettingTab(this.app, this));
 	}
 
-	onunload() {}
+	onunload() {
+		this.parkHost?.remove();
+		this.parkedFrames.clear();
+		this.linkedNoteLeaves.clear();
+	}
 
 	renderTimeline(mw: string, el: HTMLElement) {
 		const container = el.createEl('div', {

@@ -1,5 +1,29 @@
 # Markwhen Obsidian Plugin
 
+## This branch
+
+`fix/event-detail-build` on [Timo21/obsidian-plugin](https://github.com/Timo21/obsidian-plugin) starts from [`feature/event-detail-modal`](https://github.com/cybersader/obsidian-plugin/tree/feature/event-detail-modal) at `bce18b7` in [cybersader/obsidian-plugin](https://github.com/cybersader/obsidian-plugin). It makes that event-detail branch build again. Clicking a timeline bar opens that event’s note. If the event contains a wikilink to a markdown file in the vault, the note opens in a pane to the right of the timeline. Otherwise a modal edits only that event. The timeline keeps its place when you leave it or close the note pane.
+
+The compiled `main.js` is not in the repo. Build it locally, then copy the three files Obsidian loads. Turn off the community Markwhen plugin first. Both use the id `markwhen`.
+
+```sh
+git clone https://github.com/Timo21/obsidian-plugin.git
+cd obsidian-plugin
+git checkout fix/event-detail-build
+npm install
+npm run build
+```
+
+Copy these into `[your vault]/.obsidian/plugins/markwhen/`:
+
+- `out/main.js`, renamed to `main.js`
+- `manifest.json`
+- `styles.css`
+
+Reload Obsidian and enable Markwhen. Node 20 or newer is enough to build.
+
+# Upstream plugin
+
 [Markwhen docs](https://docs.markwhen.com)
 
 ![markwhen-obsidian-plugin](./assets/screenshot.png)

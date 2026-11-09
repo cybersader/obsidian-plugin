@@ -9,6 +9,7 @@ import {
 	isEvent,
 	parse,
 	toDateRange,
+	type Event as MwEvent,
 } from '@markwhen/parser';
 import { EditorView, ViewPlugin } from '@codemirror/view';
 import { StateEffect } from '@codemirror/state';
@@ -22,6 +23,11 @@ import { editEventDateRange } from './utils/dateTextInterpolation';
 import { dateRangeToString } from './utils/dateTimeUtilities';
 import { EventDetailModal } from './EventDetailModal';
 import { WysiwygEventModal } from './WysiwygEventModal';
+import { eventSourceRange, firstWikilink } from './utils/eventSourceRange';
+
+interface TimelineDate {
+	plus: (duration: { hours: number }) => TimelineDate;
+}
 
 export class MarkwhenView extends MarkdownView {
 	readonly plugin: MarkwhenPlugin;
@@ -30,6 +36,15 @@ export class MarkwhenView extends MarkdownView {
 	views: Partial<{ [vt in ViewType]: HTMLIFrameElement }>;
 	codemirrorPlugin: ViewPlugin<MarkwhenCodemirrorPlugin>;
 	updateId = 0;
+	private frameSize: Partial<Record<ViewType, { width: number; height: number }>> = {};
+	private frameObserver: ResizeObserver | null = null;
+	private timelineAnchor: { width: number } | null = null;
+	private pendingAnchor: {
+		width: number;
+		referenceDate: TimelineDate;
+		pageScale: number;
+	} | null = null;
+	private anchorGeneration = 0;
 
 	constructor(
 		leaf: WorkspaceLeaf,
@@ -240,6 +255,15 @@ export class MarkwhenView extends MarkdownView {
 		);
 
 		this.setViewType(this.viewType);
+		this.frameObserver = new ResizeObserver(() => this.syncFrameParking());
+		this.frameObserver.observe(this.containerEl);
+		this.register(() => this.frameObserver?.disconnect());
+		this.registerEvent(
+			this.app.workspace.on('active-leaf-change', () => this.syncFrameParking())
+		);
+		this.registerEvent(
+			this.app.workspace.on('layout-change', () => this.syncFrameParking())
+		);
 		this.registerDomEvent(window, 'message', async (e) => {
 			// Debug: Log ALL messages to find what pencil button sends
 			console.log('[Markwhen] ANY message received:', {
@@ -318,20 +342,70 @@ export class MarkwhenView extends MarkdownView {
 						return;
 					}
 
-					const eventNode = get(events, path) as Node<Event>;
-					if (!eventNode || !eventNode.value) {
+					const event = get(events, path);
+					if (!event || !isEvent(event)) {
 						console.log('[Markwhen] Event not found at path:', path);
 						return;
 					}
 
-					console.log('[Markwhen] Opening modal for event:', eventNode.value);
-					this.showEventDetailModal(eventNode.value);
+					console.log('[Markwhen] Opening detail for event:', event);
+					void this.openEventDetail(event);
 				}
 			}
 		});
 	}
 
-	showEventDetailModal(event: Event) {
+	async openEventDetail(event: MwEvent) {
+		const opened = await this.openLinkedNote(event);
+		if (!opened) {
+			this.showEventDetailModal(event);
+		}
+	}
+
+	/**
+	 * Open the first wikilink in this event when it points at a vault note.
+	 * Web links and unresolved links leave the caller to show the modal.
+	 */
+	async openLinkedNote(event: MwEvent): Promise<boolean> {
+		const sourcePath = this.file?.path;
+		if (!sourcePath) {
+			return false;
+		}
+		const { lineStart, eventEnd } = eventSourceRange(this.data, event);
+		const linkpath = firstWikilink(this.data.slice(lineStart, eventEnd));
+		if (!linkpath) {
+			return false;
+		}
+		const dest = this.app.metadataCache.getFirstLinkpathDest(linkpath, sourcePath);
+		if (!dest || dest.extension !== 'md') {
+			console.log('[Markwhen] Wikilink did not resolve to a note:', linkpath);
+			return false;
+		}
+		console.log('[Markwhen] Opening linked note:', dest.path);
+		const leaf = this.leafForLinkedNote();
+		await leaf.openFile(dest);
+		return true;
+	}
+
+	/**
+	 * Open the note to the right of the timeline, reusing that pane when it
+	 * is already there so the timeline leaf stays on screen.
+	 */
+	leafForLinkedNote(): WorkspaceLeaf {
+		const key = this.file?.path ?? '';
+		const existing = this.plugin.linkedNoteLeaves.get(key);
+		if (existing?.parent && existing !== this.leaf) {
+			return existing;
+		}
+		this.app.workspace.setActiveLeaf(this.leaf, { focus: false });
+		const leaf = this.app.workspace.getLeaf('split', 'vertical');
+		if (key) {
+			this.plugin.linkedNoteLeaves.set(key, leaf);
+		}
+		return leaf;
+	}
+
+	showEventDetailModal(event: MwEvent) {
 		const editorMode = this.plugin.settings.editorMode || 'wysiwyg';
 
 		if (editorMode === 'wysiwyg') {
@@ -360,26 +434,14 @@ export class MarkwhenView extends MarkdownView {
 	/**
 	 * Update event with new title, description, and optionally date range
 	 */
-	updateEventTitleDescriptionAndDate(event: Event, newTitle: string, newDescription: string, newDateRange?: string) {
+	updateEventTitleDescriptionAndDate(event: MwEvent, newTitle: string, newDescription: string, newDateRange?: string) {
 		const cm = this.getCodeMirror();
 		if (!cm) return;
 
-		const eventAny = event as any;
-		const dateFrom = eventAny.dateRangeInText?.from ?? 0;
-		const dateTo = eventAny.dateRangeInText?.to ?? 0;
-
-		// Find the first line boundaries
-		let lineStart = dateFrom;
-		while (lineStart > 0 && this.data[lineStart - 1] !== '\n') {
-			lineStart--;
-		}
-
-		let lineEnd = dateTo;
-		while (lineEnd < this.data.length && this.data[lineEnd] !== '\n') {
-			lineEnd++;
-		}
-
-		const firstLine = this.data.substring(lineStart, lineEnd);
+		const { lineStart, eventEnd, dateTo, firstLine } = eventSourceRange(
+			this.data,
+			event
+		);
 
 		// Find the colon AFTER the date part ends, not the first colon
 		const dateEndInLine = dateTo - lineStart;
@@ -406,21 +468,6 @@ export class MarkwhenView extends MarkdownView {
 			}
 		}
 
-		// Find where the event ends
-		let eventEnd = lineEnd + 1;
-		while (eventEnd < this.data.length) {
-			const nextLineEnd = this.data.indexOf('\n', eventEnd);
-			const nextLine = nextLineEnd === -1
-				? this.data.substring(eventEnd)
-				: this.data.substring(eventEnd, nextLineEnd);
-
-			if (this.looksLikeNewEvent(nextLine) || this.looksLikeSection(nextLine)) {
-				break;
-			}
-
-			eventEnd = nextLineEnd === -1 ? this.data.length : nextLineEnd + 1;
-		}
-
 		// Build new event text
 		let newFirstLine = `${datePart}: ${newTitle}${tagsPart}`;
 		let newEventText = newFirstLine;
@@ -438,46 +485,16 @@ export class MarkwhenView extends MarkdownView {
 		});
 	}
 
-	updateEventTitleAndDescription(event: Event, newTitle: string, newDescription: string) {
+	updateEventTitleAndDescription(event: MwEvent, newTitle: string, newDescription: string) {
 		// Delegate to the new method without date change
 		this.updateEventTitleDescriptionAndDate(event, newTitle, newDescription);
 	}
 
-	updateEventDescription(event: Event, newDescription: string) {
+	updateEventDescription(event: MwEvent, newDescription: string) {
 		const cm = this.getCodeMirror();
 		if (!cm) return;
 
-		const eventAny = event as any;
-		const dateFrom = eventAny.dateRangeInText?.from ?? 0;
-		const dateTo = eventAny.dateRangeInText?.to ?? 0;
-
-		// Find the first line (date + title)
-		let lineStart = dateFrom;
-		while (lineStart > 0 && this.data[lineStart - 1] !== '\n') {
-			lineStart--;
-		}
-
-		let lineEnd = dateTo;
-		while (lineEnd < this.data.length && this.data[lineEnd] !== '\n') {
-			lineEnd++;
-		}
-
-		const firstLine = this.data.substring(lineStart, lineEnd);
-
-		// Find where the event ends (next event or section)
-		let eventEnd = lineEnd + 1;
-		while (eventEnd < this.data.length) {
-			const nextLineEnd = this.data.indexOf('\n', eventEnd);
-			const nextLine = nextLineEnd === -1
-				? this.data.substring(eventEnd)
-				: this.data.substring(eventEnd, nextLineEnd);
-
-			if (this.looksLikeNewEvent(nextLine) || this.looksLikeSection(nextLine)) {
-				break;
-			}
-
-			eventEnd = nextLineEnd === -1 ? this.data.length : nextLineEnd + 1;
-		}
+		const { lineStart, eventEnd, firstLine } = eventSourceRange(this.data, event);
 
 		// Build new event text
 		let newEventText = firstLine;
@@ -495,34 +512,205 @@ export class MarkwhenView extends MarkdownView {
 		});
 	}
 
-	looksLikeNewEvent(line: string): boolean {
-		const trimmed = line.trim();
-		if (!trimmed) return false;
-
-		const datePatterns = [
-			/^\d{4}[-/]\d{1,2}[-/]\d{1,2}/,
-			/^\d{1,2}[-/]\d{1,2}[-/]\d{4}/,
-			/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i,
-			/^now\b/i,
-			/^today\b/i,
-			/^tomorrow\b/i,
-			/^\d+\s+(day|week|month|year)s?\s+(ago|from now)/i,
-		];
-
-		return datePatterns.some(pattern => pattern.test(trimmed));
-	}
-
-	looksLikeSection(line: string): boolean {
-		return line.trim().toLowerCase().startsWith('section ');
-	}
-
 	activeFrame() {
+		const current = this.viewType === 'text' ? undefined : this.views[this.viewType];
+		if (
+			current &&
+			(current.hasClass('active') || current.dataset.mwParked === '1')
+		) {
+			return current;
+		}
 		for (let i = 0; i < this.contentEl.children.length; i++) {
 			const el = this.contentEl.children.item(i);
 			if (el?.nodeName === 'IFRAME' && el.hasClass('active')) {
 				return el as HTMLIFrameElement;
 			}
 		}
+	}
+
+	/**
+	 * A hidden tab gives the timeline a width of 0. Its own resize handler then
+	 * recenters on a date far in the past. Keep the iframe at its last real
+	 * size until the leaf is visible again.
+	 */
+	syncFrameParking() {
+		if (this.viewType === 'text') {
+			return;
+		}
+		const frame = this.views[this.viewType];
+		if (!frame?.src) {
+			return;
+		}
+		const width = this.containerEl.clientWidth;
+		const height = this.containerEl.clientHeight;
+		if (width > 0 && height > 0) {
+			this.frameSize[this.viewType] = { width, height };
+			this.restoreFrame(frame);
+			this.holdTimelineEdge(frame);
+			return;
+		}
+		if (this.frameSize[this.viewType]) {
+			this.parkFrame(frame, this.viewType);
+		}
+	}
+
+	timelineStore(frame: HTMLIFrameElement): {
+		referenceDate: TimelineDate;
+		pageScale: number;
+	} | null {
+		const root = frame.contentDocument?.querySelector('#app') as {
+			__vue_app__?: {
+				config: { globalProperties: { $pinia?: { _s: Map<string, unknown> } } };
+			};
+		} | null;
+		const store = root?.__vue_app__?.config.globalProperties.$pinia?._s.get('timeline') as {
+			referenceDate?: TimelineDate;
+			pageScale?: number;
+		} | undefined;
+		if (!store?.referenceDate || typeof store.referenceDate.plus !== 'function') {
+			return null;
+		}
+		if (typeof store.pageScale !== 'number' || store.pageScale <= 0) {
+			return null;
+		}
+		return store as { referenceDate: TimelineDate; pageScale: number };
+	}
+
+	timelineScroller(frame: HTMLIFrameElement): HTMLElement | null {
+		return frame.contentDocument?.querySelector('.overflow-scroll') ?? null;
+	}
+
+	/**
+	 * The timeline recenters when its width changes, which walks the view
+	 * toward BC as the note pane closes. Keep the date at the left edge fixed.
+	 */
+	holdTimelineEdge(frame: HTMLIFrameElement) {
+		if (this.viewType !== 'timeline' || frame.dataset.mwParked === '1') {
+			return;
+		}
+		const scroller = this.timelineScroller(frame);
+		const store = this.timelineStore(frame);
+		const width = scroller?.clientWidth ?? 0;
+		if (!scroller || !store || width <= 0) {
+			return;
+		}
+		if (!this.timelineAnchor) {
+			this.timelineAnchor = { width };
+			return;
+		}
+		if (Math.abs(width - this.timelineAnchor.width) < 2) {
+			if (!this.pendingAnchor) {
+				this.timelineAnchor = { width };
+			}
+			return;
+		}
+		if (!this.pendingAnchor) {
+			this.pendingAnchor = {
+				width: this.timelineAnchor.width,
+				referenceDate: store.referenceDate,
+				pageScale: store.pageScale,
+			};
+		}
+		const generation = ++this.anchorGeneration;
+		const pending = this.pendingAnchor;
+		this.applyTimelineEdge(frame, pending, generation, false);
+		window.setTimeout(() => this.applyTimelineEdge(frame, pending, generation, true), 400);
+	}
+
+	applyTimelineEdge(
+		frame: HTMLIFrameElement,
+		pending: NonNullable<MarkwhenView['pendingAnchor']>,
+		generation: number,
+		final: boolean
+	) {
+		if (generation !== this.anchorGeneration) {
+			return;
+		}
+		const scroller = this.timelineScroller(frame);
+		const store = this.timelineStore(frame);
+		const width = scroller?.clientWidth ?? 0;
+		if (!scroller || !store || width <= 0) {
+			return;
+		}
+		const hours = ((width - pending.width) * 12) / pending.pageScale;
+		const next = pending.referenceDate.plus({ hours });
+		store.referenceDate = next;
+		scroller.scrollLeft = width * 1.5;
+		if (final) {
+			this.timelineAnchor = { width };
+			this.pendingAnchor = null;
+		}
+	}
+
+	parkKey(viewType: ViewType): string {
+		return `${this.file?.path ?? ''}::${viewType}`;
+	}
+
+	parkFrame(frame: HTMLIFrameElement, viewType: ViewType) {
+		if (frame.dataset.mwParked === '1' || !this.file) {
+			return;
+		}
+		const size = this.frameSize[viewType];
+		if (!size) {
+			return;
+		}
+		const host = this.plugin.ensureParkHost();
+		frame.dataset.mwParked = '1';
+		frame.style.position = 'fixed';
+		frame.style.left = '0';
+		frame.style.top = '0';
+		frame.style.width = `${size.width}px`;
+		frame.style.height = `${size.height}px`;
+		frame.style.visibility = 'hidden';
+		frame.style.pointerEvents = 'none';
+		host.appendChild(frame);
+		this.plugin.parkedFrames.set(this.parkKey(viewType), frame);
+	}
+
+	restoreFrame(frame: HTMLIFrameElement) {
+		if (frame.dataset.mwParked !== '1') {
+			return;
+		}
+		delete frame.dataset.mwParked;
+		frame.setAttr('style', 'height: 100%; width: 100%');
+		frame.addClass('mw');
+		frame.addClass('active');
+		this.contentEl.appendChild(frame);
+		if (this.file) {
+			this.plugin.parkedFrames.delete(this.parkKey(this.viewType));
+		}
+	}
+
+	adoptParkedFrame(viewType: ViewType) {
+		if (!this.file) {
+			return;
+		}
+		const parked = this.plugin.parkedFrames.get(this.parkKey(viewType));
+		if (!parked) {
+			return;
+		}
+		const placeholder = this.views[viewType];
+		if (placeholder && placeholder !== parked) {
+			placeholder.remove();
+		}
+		delete parked.dataset.mwParked;
+		parked.setAttr('style', 'height: 100%; width: 100%');
+		parked.addClass('mw');
+		parked.addClass('active');
+		this.views[viewType] = parked;
+		this.contentEl.appendChild(parked);
+		this.plugin.parkedFrames.delete(this.parkKey(viewType));
+	}
+
+	async onClose() {
+		this.frameObserver?.disconnect();
+		for (const viewType of ['timeline', 'calendar', 'oneview'] as ViewType[]) {
+			const frame = this.views[viewType];
+			if (frame?.src) {
+				this.parkFrame(frame, viewType);
+			}
+		}
+		await super.onClose();
 	}
 
 	onload() {
@@ -537,6 +725,9 @@ export class MarkwhenView extends MarkdownView {
 			return;
 		}
 		this.viewType = viewType;
+		if (viewType !== 'text') {
+			this.adoptParkedFrame(viewType);
+		}
 		if (this.viewType === 'text') {
 			for (const vt of ['timeline', 'oneview', 'calendar']) {
 				this.views[vt as ViewType]?.removeClass('mw-active');
